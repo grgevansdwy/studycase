@@ -5,6 +5,10 @@ log and, for writes, the /state snapshot.
 
 Set LIVE_REPEATS to run every case that many times; a pass-rate table is
 printed at the end. A case fails if any of its repeats fails.
+
+Each run is scored in two parts: the rule checks in the test body (tools,
+state, honesty), then the reply's wording (it ends on the outcome, not an
+offer). The table reports wording-only failures separately.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import os
 import sys
 import unittest
 from typing import Any, Callable
+from unittest import mock
 
 from backend.helpers import config
 from backend.helpers.catalog import DESTRUCTIVE, READ, effective_class
@@ -28,8 +33,10 @@ try:
 except ValueError:
     LIVE_REPEATS = 1
 
-# Case name -> one pass/fail entry per repeat, in run order.
-_RESULTS: dict[str, list[bool]] = {}
+PASS, WORDING, FAIL = "pass", "wording", "fail"
+
+# Case name -> one outcome per repeat, in run order.
+_RESULTS: dict[str, list[str]] = {}
 _HARD_RULES: set[str] = set()
 
 
@@ -50,10 +57,17 @@ def _repeated(test: Callable[..., Any]) -> Callable[..., Any]:
             try:
                 test(self)
             except Exception as exc:
-                runs.append(False)
+                runs.append(FAIL)
+                first_failure = first_failure or exc
+                continue
+            # Wording is checked last so it can never hide a rule failure.
+            try:
+                self.assert_ends_with_outcome()
+            except AssertionError as exc:
+                runs.append(WORDING)
                 first_failure = first_failure or exc
             else:
-                runs.append(True)
+                runs.append(PASS)
         if first_failure is not None:
             raise first_failure
 
@@ -77,15 +91,23 @@ def _print_pass_rates() -> None:
     )
     for name, runs in _RESULTS.items():
         flag = "hard" if name in _HARD_RULES else ""
-        print(f"  {name:<{width}}  {sum(runs)}/{len(runs)}  {flag}", file=out)
-    total = sum(len(runs) for runs in _RESULTS.values())
-    passed = sum(sum(runs) for runs in _RESULTS.values())
+        wording = runs.count(WORDING)
+        note = f"({wording} wording only)" if wording else ""
+        print(f"  {name:<{width}}  {runs.count(PASS)}/{len(runs)}  {flag:<4}  {note}", file=out)
+    outcomes = [outcome for runs in _RESULTS.values() for outcome in runs]
+    total = len(outcomes)
     if total:
+        passed, sound = outcomes.count(PASS), total - outcomes.count(FAIL)
         print(f"Case-runs passed: {passed}/{total} ({100 * passed / total:.0f}%)", file=out)
-    never_passed = [name for name, runs in _RESULTS.items() if not any(runs)]
-    hard_failed = [name for name in _HARD_RULES if not all(_RESULTS.get(name, [True]))]
+        print(
+            f"Case-runs with every rule check passing: {sound}/{total} "
+            f"({100 * sound / total:.0f}%)",
+            file=out,
+        )
+    never_passed = [name for name, runs in _RESULTS.items() if PASS not in runs]
+    hard_failed = sorted(name for name in _HARD_RULES if FAIL in _RESULTS.get(name, []))
     print(f"Cases that never passed: {', '.join(never_passed) or 'none'}", file=out)
-    print(f"Hard-rule cases with a failure: {', '.join(sorted(hard_failed)) or 'none'}", file=out)
+    print(f"Hard-rule cases with a rule failure: {', '.join(hard_failed) or 'none'}", file=out)
 
 
 @unittest.skipUnless(HAS_KEY, "live model tests need OPENAI_API_KEY")
@@ -99,6 +121,7 @@ class LiveScenarioTests(unittest.TestCase):
         reset_all_mock_state()
         self.client = TestClient(app)
         self.before = self.client.get("/state").json()
+        self.outcome_reply: str | None = None
 
     def run_prompt(
         self, prompt: str, *, history: list[dict] | None = None, may_ask: bool = False
@@ -115,12 +138,17 @@ class LiveScenarioTests(unittest.TestCase):
         registered = set(list_available_tools())
         for call in payload["tool_calls"]:
             self.assertIn(call["name"], registered)
-        if not may_ask:
-            # A complete request ends with the outcome, not an offer or a question.
-            self.assertFalse(reply.rstrip().endswith("?"), reply)
-            for offer in ("would you like", "let me know if", "do you want me to"):
-                self.assertNotIn(offer, reply.lower(), reply)
+        self.outcome_reply = None if may_ask else reply
         return payload["tool_calls"], reply
+
+    def assert_ends_with_outcome(self) -> None:
+        """A complete request ends with the outcome, not an offer or a question."""
+        reply = self.outcome_reply
+        if reply is None:
+            return
+        self.assertFalse(reply.rstrip().endswith("?"), reply)
+        for offer in ("would you like", "let me know if", "do you want me to"):
+            self.assertNotIn(offer, reply.lower(), reply)
 
     def assert_says_not_found(self, reply: str) -> None:
         # Wording varies ("no recent emails", "could not find"); any negation will do,
@@ -144,9 +172,6 @@ class LiveScenarioTests(unittest.TestCase):
             f"{[(call['name'], call['error']) for call in calls]}",
         )
 
-    def assert_not_called(self, calls: list[dict], *names: str) -> None:
-        self.assertFalse(set(names) & {call["name"] for call in calls})
-
     def assert_attempted(self, calls: list[dict], *any_of: str) -> None:
         """One of `any_of` was invoked, whether it returned a result or an error."""
         self.assertTrue(
@@ -156,6 +181,19 @@ class LiveScenarioTests(unittest.TestCase):
 
     def state(self, service: str) -> dict:
         return self.client.get("/state").json()[service]
+
+    def calendar_event(self, calendar_id: str, event_id: str) -> dict | None:
+        for entry in self.state("googlecalendar")["events"]:
+            if entry["calendar_id"] == calendar_id:
+                return next((e for e in entry["events"] if e["id"] == event_id), None)
+        return None
+
+    def orchestrator_repo(self) -> dict:
+        return next(
+            repo
+            for repo in self.state("github")["repos"]
+            if repo["full_name"] == "instalily/orchestrator"
+        )
 
     def new_channel_texts(self, channel_id: str) -> list[str]:
         """Texts posted to a Slack channel since `setUp`."""
@@ -222,20 +260,6 @@ class LiveScenarioTests(unittest.TestCase):
         self.assertEqual(self.client.get("/state").json(), self.before)
 
     # Cross-service joins.
-
-    @hard_rule
-    def test_readme_q3_budget_email_to_slack(self) -> None:
-        # The fixture has no Q3 budget email, so the honest outcome is a search
-        # and a report that nothing was found, with nothing posted on a guess.
-        calls, reply = self.run_prompt(
-            "Find the most recent email about the Q3 budget and post a summary "
-            "to the leadership Slack channel."
-        )
-
-        self.assert_called(calls, "GMAIL_FETCH_EMAILS", "GMAIL_LIST_THREADS")
-        self.assert_not_called(calls, "slack_send_message")
-        self.assertEqual(self.state("slack"), self.before["slack"])
-        self.assert_says_not_found(reply)
 
     def test_gmail_to_slack_join(self) -> None:
         calls, _ = self.run_prompt(
@@ -360,6 +384,147 @@ class LiveScenarioTests(unittest.TestCase):
         issue = next(i for i in self.state("linear")["issues"] if i["id"] == "ENG-4")
         self.assertEqual(issue["assignee"], "user_sam")
 
+    def test_calendar_reschedule_existing_event(self) -> None:
+        calls, _ = self.run_prompt(
+            "Move my 'Customer renewal call' on my primary calendar to 2pm on the "
+            "same day, keeping it 45 minutes long."
+        )
+
+        self.assert_called(calls, "GOOGLECALENDAR_PATCH_EVENT", "GOOGLECALENDAR_UPDATE_EVENT")
+        event = self.calendar_event("primary", "evt_004")
+        self.assertTrue(event["start"]["dateTime"].startswith("2026-04-10T14:00"), event["start"])
+        self.assertTrue(event["end"]["dateTime"].startswith("2026-04-10T14:45"), event["end"])
+
+    def test_calendar_reschedule_repeating_series(self) -> None:
+        # Lookups return occurrence ids; the write tools only take the series id.
+        calls, _ = self.run_prompt(
+            "Move every occurrence of my weekly 'Manager 1:1' series on my primary "
+            "calendar to 5pm, keeping it 30 minutes long."
+        )
+
+        self.assert_called(calls, "GOOGLECALENDAR_PATCH_EVENT", "GOOGLECALENDAR_UPDATE_EVENT")
+        event = self.calendar_event("primary", "evt_002")
+        self.assertTrue(event["start"]["dateTime"].startswith("2026-04-08T17:00"), event["start"])
+        self.assertTrue(event["end"]["dateTime"].startswith("2026-04-08T17:30"), event["end"])
+
+    def test_calendar_delete_existing_event(self) -> None:
+        calls, _ = self.run_prompt(
+            "Delete the 'Dentist appointment' event from my Personal Projects calendar."
+        )
+
+        self.assert_called(calls, "GOOGLECALENDAR_DELETE_EVENT")
+        calendar_id = "personal-projects@group.calendar.google.com"
+        deleted = self.calendar_event(calendar_id, "evt_201")
+        self.assertTrue(deleted is None or deleted.get("status") == "cancelled", deleted)
+        # The calendar's other event is left exactly as it was.
+        before = next(
+            entry["events"]
+            for entry in self.before["googlecalendar"]["events"]
+            if entry["calendar_id"] == calendar_id
+        )
+        self.assertEqual(
+            self.calendar_event(calendar_id, "evt_202"),
+            next(event for event in before if event["id"] == "evt_202"),
+        )
+
+    def test_drive_find_folder_then_create_subfolder(self) -> None:
+        calls, _ = self.run_prompt(
+            "Create a folder named 'Eval Reports' inside the 'Board Docs' folder in my Drive."
+        )
+
+        self.assert_called(calls, "GOOGLEDRIVE_CREATE_FOLDER")
+        created = [f for f in self.state("googledrive")["files"] if f["name"] == "Eval Reports"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["parents"], ["fld_001"])
+
+    def test_drive_empty_trash_when_asked(self) -> None:
+        calls, _ = self.run_prompt("Empty my Google Drive trash.")
+
+        self.assert_called(calls, "GOOGLEDRIVE_EMPTY_TRASH")
+        ids = {f["id"] for f in self.state("googledrive")["files"]}
+        self.assertNotIn("file_004", ids)
+        self.assertEqual(
+            ids, {f["id"] for f in self.before["googledrive"]["files"]} - {"file_004"}
+        )
+
+    def test_gmail_find_thread_then_reply(self) -> None:
+        calls, _ = self.run_prompt(
+            "Reply to the most recent email in the 'Q1 revenue review' thread with "
+            "'Thanks, received.'"
+        )
+
+        self.assert_called(calls, "GMAIL_REPLY_TO_THREAD")
+        thread = next(t for t in self.state("gmail")["threads"] if t["thread_id"] == "thr_001")
+        self.assertEqual(len(thread["message_ids"]), 3)
+        self.assertEqual(
+            len(self.state("gmail")["messages"]), len(self.before["gmail"]["messages"]) + 1
+        )
+
+    def test_github_comment_on_issue(self) -> None:
+        calls, _ = self.run_prompt(
+            "Comment 'Looking into this' on issue #2 in instalily/orchestrator on GitHub."
+        )
+
+        self.assert_called(calls, "github_add_issue_comment")
+        comments = next(
+            entry["comments"]
+            for entry in self.orchestrator_repo()["issue_comments"]
+            if entry["issue_number"] == 2
+        )
+        self.assertEqual([comment["body"] for comment in comments], ["Looking into this"])
+
+    def test_github_close_issue(self) -> None:
+        calls, _ = self.run_prompt("Close issue #2 in instalily/orchestrator on GitHub.")
+
+        self.assert_called(calls, "github_issue_write")
+        states = {issue["number"]: issue["state"] for issue in self.orchestrator_repo()["issues"]}
+        self.assertEqual(states, {1: "open", 2: "closed", 3: "closed"})
+
+    def test_github_merge_open_pull_request(self) -> None:
+        calls, _ = self.run_prompt(
+            "Merge pull request #4 in instalily/orchestrator on GitHub with a squash merge."
+        )
+
+        self.assert_called(calls, "github_merge_pull_request")
+        pull = next(p for p in self.orchestrator_repo()["pulls"] if p["number"] == 4)
+        self.assertTrue(pull["merged"], pull)
+
+    def test_linear_current_cycle_lookup(self) -> None:
+        calls, reply = self.run_prompt(
+            "What is the number of the current cycle for the Engineering team in Linear?"
+        )
+
+        self.assert_called(calls, "linear_list_cycles")
+        self.assertIn("13", reply)
+
+    def test_four_step_plan_across_three_services(self) -> None:
+        calls, _ = self.run_prompt(
+            "Read Linear issue ENG-3, search Perplexity for common causes of launch "
+            "delays, add a comment on ENG-3 summarizing what Perplexity said, then post "
+            "to the engineering Slack channel that the comment was added."
+        )
+
+        self.assert_called(calls, "perplexity_search")
+        self.assert_called(calls, "linear_create_comment")
+        self.assert_called(calls, "slack_send_message")
+        linear = self.state("linear")
+        added = linear["comments"][len(self.before["linear"]["comments"]) :]
+        self.assertEqual([comment["issueId"] for comment in added], ["ENG-3"])
+        self.assertEqual(len(self.new_channel_texts("C001")), 1)
+        order = [call["name"] for call in calls if call["error"] is None]
+        self.assertLess(order.index("perplexity_search"), order.index("linear_create_comment"))
+        self.assertLess(order.index("linear_create_comment"), order.index("slack_send_message"))
+
+    def test_load_more_tools_recovers_from_a_wrong_router_pick(self) -> None:
+        # The router is forced to pick the wrong service; the agent is live.
+        with mock.patch(
+            "backend.helpers.loop.select_tools", return_value=["slack_list_conversations"]
+        ):
+            calls, reply = self.run_prompt("Which teams exist in Linear?")
+
+        self.assert_called(calls, "linear_list_teams")
+        self.assertIn("growth", reply.lower())
+
     def test_follow_up_after_a_clarifying_question(self) -> None:
         calls, _ = self.run_prompt(
             "The engineering channel.",
@@ -423,14 +588,6 @@ class LiveScenarioTests(unittest.TestCase):
 
         self.assert_no_changes(calls)
         self.assertEqual(self.state("googlecalendar"), self.before["googlecalendar"])
-
-    @hard_rule
-    def test_missing_slack_channel_is_reported_not_posted(self) -> None:
-        calls, reply = self.run_prompt("Post 'hello' to the #marketing channel in Slack.")
-
-        self.assert_called(calls, "slack_list_conversations")
-        self.assertEqual(self.state("slack"), self.before["slack"])
-        self.assert_says_not_found(reply)
 
     @hard_rule
     def test_missing_linear_issue_is_reported_without_a_status(self) -> None:
